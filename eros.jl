@@ -53,7 +53,7 @@ end
 
 struct Coord
     R :: Float64 # distance from the origin (the sun)
-    θ :: Float64 # angle from the J2000 ecliptic
+    f :: Float64 # angle from the J2000 ecliptic
 end
 
 struct Transfer
@@ -78,6 +78,12 @@ const G          :: Float64 = 6.67430e-11
 const AU         :: Float64 = 1.495978707e11
 const J2000      :: Float64 = 2451545.0
 const solar_mass :: Float64 = 1.98847e30
+
+# all values in days / JD
+const soonest_launch :: Float64 = 2451908.5 # 30 Dec 2000
+const launch_lookahead  :: Float64 = 2000
+const shortest_transfer :: Float64 = 100
+const longest_transfer  :: Float64 = 500
 
 # https://ssd.jpl.nasa.gov/planets/approx_pos.html
 const earth_orbit = Orbit(
@@ -147,7 +153,7 @@ function jd_to_date(jd::Number)
     e = 4 * f + 3
     g = mod(e, 1461) ÷ 4
     h = 5 * g + 2
-    D = (mod(h, 153)) ÷ 5 + 1
+    D = mod(h, 153) ÷ 5 + 1
     M = mod(h ÷ 153 + 2, 12) + 1
     Y = e ÷ 1461 - 4716 + (12 + 2 - M) ÷ 12
 
@@ -192,8 +198,8 @@ end
 
 # eccentric anomaly to true anomaly
 function E_to_f(E::Float64, o::Orbit)
-    β = o.e / (1 + sqrt(1 - o.e^2))
-    return E + 2 * atan(β*sin(E)/(1-β*cos(E)))
+    β = (1 + sqrt(1 - o.e^2)) / o.e
+    return E + 2 * atan(sin(E)/(β-cos(E)))
 end
 
 # true anomaly to eccentric anomaly
@@ -231,9 +237,8 @@ function t_to_v(t::Float64, o::Orbit)
     return [cos(o.ϖ) -sin(o.ϖ); sin(o.ϖ) cos(o.ϖ)] * v
 end
 
-function low_energy_apsis(θ1::Float64, θ2::Float64)
-    # explanation: https://www.desmos.com/calculator/qcscapoyvt
-    return mod((θ1 - θ2)/2, π) + π/2 + θ2
+function low_energy_apsis(f1::Float64, f2::Float64)
+    return (f1 + f2 + π) * 0.5
 end
 
 function geo_orbit_v(obj::Body)
@@ -243,10 +248,10 @@ end
 # ------------------ ALGORITHM ------------------ #
 
 function transfer_orbit(L::Coord, A::Coord, t_l::Float64, h::Float64) :: Union{Orbit, Nothing}
-    ϖ = low_energy_apsis(L.θ, A.θ) + h
+    ϖ = low_energy_apsis(L.f, A.f) + h
 
-    cosL = cos(L.θ - ϖ)
-    cosA = cos(A.θ - ϖ)
+    cosL = cos(L.f - ϖ)
+    cosA = cos(A.f - ϖ)
 
     # compute the eccentricity
     denom = (L.R * cosL - A.R * cosA)
@@ -270,7 +275,7 @@ function transfer_orbit(L::Coord, A::Coord, t_l::Float64, h::Float64) :: Union{O
     n = sqrt(G * solar_mass / a^3) * (24*60^2)
 
     # compute the mean longitude at launch, t_l
-    E_l = f_to_E(-ϖ + L.θ, e)
+    E_l = f_to_E(L.f - ϖ, e)
     L_l = E_to_M(E_l, e) + ϖ
 
     return Orbit(a, e, n, ϖ, L_l, t_l)
@@ -291,21 +296,20 @@ function transfer_Δvs(
     rotatary_v_l = v_l_f * v_l_f_rlen * geo_orbit_v(b_l)
     rotatary_v_a = v_a_i * v_a_i_rlen * geo_orbit_v(b_a)
 
-    # calculate candidate leaving and arrival deltavees,
-    # depending on which side of the planet the spaceship leaves/approaches
+    # calculate candidate leaving and arrival deltavees
+    Δv_l = √sum((v_l_f - v_l_i - rotatary_v_l).^2)
+    # depending on which side of the planet the spaceship approaches
     # relative to its direction of rotation
-    Δv_l_1 = √sum((v_l_f - v_l_i - rotatary_v_l).^2)
-    Δv_l_2 = √sum((v_l_f - v_l_i + rotatary_v_l).^2)
     Δv_a_1 = √sum((v_a_f - v_a_i - rotatary_v_a).^2)
     Δv_a_2 = √sum((v_a_f - v_a_i + rotatary_v_a).^2)
     
     # enter orbit in whichever direction is easiest
-    return min(Δv_l_1, Δv_l_2), min(Δv_a_1, Δv_a_2)
+    return Δv_l, min(Δv_a_1, Δv_a_2)
 end
 
 function find_transfers(
-    t_0::Float64, 
-    t_f::Float64, 
+    soonest_launch::Float64, 
+    latest_launch::Float64, 
     orbit_l::Orbit, 
     orbit_a::Orbit, 
     body_l::Body, 
@@ -314,9 +318,9 @@ function find_transfers(
     transfers = Transfer[]
     
     # foreach launch date
-    for t_l ∈ t_0:t_f
+    for t_l ∈ soonest_launch:latest_launch
         # foreach arrival date
-        for t_a ∈ t_l+100:t_l+500
+        for t_a ∈ t_l+shortest_transfer:t_l+longest_transfer
     
             r_l = t_to_r(t_l, orbit_l) 
             r_a = t_to_r(t_a, orbit_a)
@@ -332,7 +336,7 @@ function find_transfers(
 
                     # check whether the spaceship and celestial body coincide at t_a
                     r_a_tf = t_to_r(t_a, tf_orbit)
-                    if abs(mod(r_a_tf.θ - r_a.θ + π, 2π) - π) > 0.01
+                    if abs(mod(r_a_tf.f - r_a.f + π, 2π) - π) > 0.01
                         continue
                     end
     
@@ -401,7 +405,7 @@ function display_and_choose_transfers(transfers, orbit_1, orbit_2, body_1, body_
         coords_tf = t_to_r.(jds, tf.orbit)
     
         display(plot(
-            [(c->c.θ).(coords_1) (c->c.θ).(coords_2) (c->c.θ).(coords_tf)], 
+            [(c->c.f).(coords_1) (c->c.f).(coords_2) (c->c.f).(coords_tf)], 
             [(c->c.R).(coords_1) (c->c.R).(coords_2) (c->c.R).(coords_tf)], 
             proj=:polar, 
             linewidth=range(1,10,length=length(jds)), 
@@ -425,16 +429,20 @@ function display_and_choose_transfers(transfers, orbit_1, orbit_2, body_1, body_
     return parse(Int64, readline())
 end
 
-function main() 
+function main()
     orbit_1 = earth_orbit
     body_1 = earth
     orbit_2 = eros_orbit
     body_2 = eros
     
-    t_0 = convert(Float64, date_to_jd(2000, 12, 30))
-    t_f = t_0+2000
-    
-    transfers = find_transfers(t_0, t_f, orbit_1, orbit_2, body_1, body_2)
+    transfers = find_transfers(
+        soonest_launch, 
+        soonest_launch + launch_lookahead, 
+        orbit_1, 
+        orbit_2, 
+        body_1, 
+        body_2,
+    )
     
     # plot energies
     display(plot(
@@ -444,7 +452,7 @@ function main()
         ylabel = "Δv",
         marker = 2,
         linealpha = 0,
-        xlims = (t_0, t_f),
+        xlims = (soonest_launch, soonest_launch + launch_lookahead),
         ylims = (0, maximum(t->t.Δv, transfers)),
         legend = false,
         title = "Δv of Possible Orbits by Date"
@@ -458,12 +466,19 @@ function main()
     outbound = transfers[tf_ind]
     
     print("Enter the minimum time to spend here in days: ")
-    dt = parse(Float64, readline())
+    layover = parse(Float64, readline())
     
-    t_0 = outbound.t_a + dt
-    t_f = t_0 + 2000
+    soonest_return = outbound.t_a + layover
+    latest_return = soonest_return + launch_lookahead
     
-    transfers = find_transfers(t_0, t_f, orbit_2, orbit_1, body_2, body_1)
+    transfers = find_transfers(
+        soonest_return, 
+        latest_return, 
+        orbit_2, 
+        orbit_1, 
+        body_2, 
+        body_1,
+    )
     
     # plot energies
     display(plot(
@@ -473,7 +488,7 @@ function main()
         ylabel = "Δv",
         marker = 2,
         linealpha = 0,
-        xlims = (t_0, t_f),
+        xlims = (soonest_return, latest_return),
         ylims = (0, maximum(t->t.Δv, transfers)),
         legend = false,
         title = "Δv of Possible Orbits by Date"
